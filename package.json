@@ -1,0 +1,13 @@
+{
+  "name": "@fortesecurities/fortecoin-exchange-contracts",
+  "version": "1.0.0",
+  "description": "fortecoin-exchange-contracts",
+  "main": "index.js",
+  "scripts": {},
+  "author": "Quentin ADAM",
+  "license": "MIT",
+  "dependencies": {
+    "@openzeppelin/contracts": "5.0.1",
+    "@openzeppelin/contracts-upgradeable": "5.0.1"
+  }
+}
