@@ -46,11 +46,11 @@ contract Exchange is Ownable {
         vault = _inventory;
     }
 
-    function request(uint32 _price, int64 _amount, uint32 _deadline) public {
+    function requestTrade(uint32 _price, int64 _amount, uint32 _deadline) public {
         requestTrade(msg.sender, _price, _amount, _deadline);
     }
 
-    function request(address _account, uint32 _price, int64 _amount, uint32 _deadline) public {
+    function requestTrade(address _account, uint32 _price, int64 _amount, uint32 _deadline) public {
         uint128 id = requestIds.generate();
         if (_amount > 0) {
             require(uint64(_amount) >= miniumumAmount, "Amount too low");
@@ -61,7 +61,7 @@ contract Exchange is Ownable {
         emit RequestTrade(_account, id, _price, _amount, _deadline);
     }
 
-    function cancel(uint128 _requestId) public {
+    function cancelTrade(uint128 _requestId) public {
         Request storage request = requests[_requestId];
         require(request.account == msg.sender, "Not owner");
         requestIds.remove(_requestId);
@@ -69,7 +69,7 @@ contract Exchange is Ownable {
         emit CancelTrade(msg.sender, _requestId);
     }
 
-    function accept(uint128 _requestId, uint32 _price) public onlyOwner {
+    function acceptTrade(uint128 _requestId, uint32 _price) public onlyOwner {
         Request storage request = requests[_requestId];
         require(request.deadline > block.timestamp, "Request expired");
 
@@ -96,7 +96,7 @@ contract Exchange is Ownable {
         emit AcceptTrade(request.account, _requestId, _price);
     }
 
-    function requests() public view returns (Request[] memory) {
+    function getRequests() public view returns (Request[] memory) {
         Request[] memory _requests = new Request[](requestIds.length());
         uint128 id = requestIds.first();
         uint256 i = 0;
@@ -110,15 +110,15 @@ contract Exchange is Ownable {
     /**
      * @dev Emitted when a trade is requested.
      */
-    event Request(address indexed account, uint128 indexed id, uint32 price, int64 amount, uint32 deadline);
+    event RequestTrade(address indexed account, uint128 indexed id, uint32 price, int64 amount, uint32 deadline);
 
     /**
      * @dev Emitted when a trade is cancelled.
      */
-    event Cancel(address indexed account, uint128 indexed id);
+    event CancelTrade(address indexed account, uint128 indexed id);
 
     /**
      * @dev Emitted when a trade is accepted.
      */
-    event Accept(address indexed account, uint128 indexed id, uint32 price);
+    event AcceptTrade(address indexed account, uint128 indexed id, uint32 price);
 }
