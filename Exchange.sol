@@ -14,6 +14,23 @@ function floorDiv(int256 a, int256 b) pure returns (int256 quotient) {
     }
 }
 
+interface AggregatorV3Interface {
+  function decimals() external view returns (uint8);
+
+  function description() external view returns (string memory);
+
+  function version() external view returns (uint256);
+
+  function getRoundData(
+    uint80 _roundId
+  ) external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+
+  function latestRoundData()
+    external
+    view
+    returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+}
+
 contract Exchange is ExtendedAccessControlUpgradeable {
     struct Request {
         address account;
@@ -25,9 +42,10 @@ contract Exchange is ExtendedAccessControlUpgradeable {
 
     error SenderUnauthorized();
     error DeadlineExpired();
-    error PriceTooLow();
-    error PriceTooHigh();
-    error AmountTooLow();
+    error DeadlineExceedsMaxDuration();
+    error PriceTooLow(uint32 price, uint32 referencePrice);
+    error PriceTooHigh(uint32 price, uint32 referencePrice);
+    error AmountTooLow(uint64 amount, uint64 minimumAmount);
     error LimitExceeded();
 
     bytes32 public constant LIMIT_ROLE = keccak256("LIMIT_ROLE");
@@ -38,6 +56,8 @@ contract Exchange is ExtendedAccessControlUpgradeable {
     address public immutable VAULT;
     uint256 public constant PRICE_DECIMALS = 6;
     uint64 public constant MINIMUM_AMOUNT = 1000000000;
+    uint32 public constant MAXIMUM_DURATION = 900;
+    AggregatorV3Interface public immutable CHAINLINK_ORACLE;
 
     Limiter limiter;
     using LimiterLibrary for Limiter;
@@ -75,11 +95,12 @@ contract Exchange is ExtendedAccessControlUpgradeable {
      */
     event TemporarilyIncreaseLimit(uint256 limitIncrease);
 
-    constructor(address _base, address _quote, address _inventory) {
+    constructor(address baseToken, address quoteToken, address vault, AggregatorV3Interface chainlinkOracle) {
         _disableInitializers();
-        BASE_TOKEN = _base;
-        QUOTE_TOKEN = _quote;
-        VAULT = _inventory;
+        BASE_TOKEN = baseToken;
+        QUOTE_TOKEN = quoteToken;
+        VAULT = vault;
+        CHAINLINK_ORACLE = chainlinkOracle;
     }
 
     function initialize(address defaultAdmin) public initializer {
@@ -101,13 +122,11 @@ contract Exchange is ExtendedAccessControlUpgradeable {
         if (request.deadline < block.timestamp) {
             revert DeadlineExpired();
         }
-
         int256 baseAmount = request.amount;
         int256 quoteAmount = computeQuoteAmount(price, baseAmount);
-
         if (baseAmount > 0) {
             if (price > request.price) {
-                revert PriceTooHigh();
+                revert PriceTooHigh(price, request.price);
             }
             if (!limiter.addOperation(uint256(baseAmount))) {
                 revert LimitExceeded();
@@ -115,23 +134,20 @@ contract Exchange is ExtendedAccessControlUpgradeable {
             IERC20(BASE_TOKEN).transferFrom(VAULT, request.account, uint256(baseAmount));
         } else {
             if (price < request.price) {
-                revert PriceTooLow();
+                revert PriceTooLow(price, request.price);
             }
             if (!limiter.addOperation(uint256(-baseAmount))) {
                 revert LimitExceeded();
             }
             IERC20(BASE_TOKEN).transferFrom(request.account, VAULT, uint256(-baseAmount));
         }
-
         if (quoteAmount > 0) {
             IERC20(QUOTE_TOKEN).transferFrom(VAULT, request.account, uint256(quoteAmount));
         } else {
             IERC20(QUOTE_TOKEN).transferFrom(request.account, VAULT, uint256(-quoteAmount));
         }
-
         requestIds.remove(requestId);
         delete requests[requestId];
-
         emit AcceptTrade(request.account, requestId, price);
     }
 
@@ -149,14 +165,16 @@ contract Exchange is ExtendedAccessControlUpgradeable {
         return floorDiv(-baseAmount * int256(uint256(price)), int256(10 ** PRICE_DECIMALS));
     }
 
-    function deleteExpiredRequests() public {
-        uint128 id = requestIds.first();
-        while (id != 0) {
-            Request memory request = requests[id];
-            if (request.deadline < block.timestamp) {
-                _deleteRequest(id);
-            }
-            id = requestIds.next(id);
+    function deleteExpiredRequest(uint128 id) public {
+        Request memory request = requests[id];
+        if (request.deadline < block.timestamp) {
+            _deleteRequest(id);
+        }
+    }
+
+    function deleteExpiredRequests(uint128[] memory ids) public {
+        for (uint256 i = 0; i < ids.length; i++) {
+            deleteExpiredRequest(ids[i]);
         }
     }
 
@@ -164,11 +182,15 @@ contract Exchange is ExtendedAccessControlUpgradeable {
         uint128 id = requestIds.first();
         while (id != 0) {
             Request memory request = requests[id];
-            if (request.deadline < block.timestamp && request.account == account) {
+            if (request.deadline < block.timestamp && (account == address(0) || request.account == account)) {
                 _deleteRequest(id);
             }
             id = requestIds.next(id);
         }
+    }
+
+    function deleteExpiredRequests() public {
+        deleteExpiredRequests(address(0));
     }
 
     function getRequests() public view returns (Request[] memory) {
@@ -186,18 +208,38 @@ contract Exchange is ExtendedAccessControlUpgradeable {
         if (deadline < block.timestamp) {
             revert DeadlineExpired();
         }
-        address account = msg.sender;
-        deleteExpiredRequests(account);
-        uint128 id = requestIds.generate();
+        if (deadline > block.timestamp + MAXIMUM_DURATION) {
+            revert DeadlineExceedsMaxDuration();
+        }
         if (amount > 0) {
             if (uint64(amount) < MINIMUM_AMOUNT) {
-                revert AmountTooLow();
+                revert AmountTooLow(uint64(amount), MINIMUM_AMOUNT);
             }
         } else {
             if (uint64(-amount) < MINIMUM_AMOUNT) {
-                revert AmountTooLow();
+                revert AmountTooLow(uint64(-amount), MINIMUM_AMOUNT);
             }
         }
+        if (address(CHAINLINK_ORACLE) != address(0)) {
+            (, int256 oraclePrice, , , ) = CHAINLINK_ORACLE.latestRoundData();
+            uint8 chainlinkDecimals = CHAINLINK_ORACLE.decimals();
+            if (chainlinkDecimals < PRICE_DECIMALS) {
+                oraclePrice *= int256(10 ** (PRICE_DECIMALS - chainlinkDecimals));
+            } else if (chainlinkDecimals > PRICE_DECIMALS) {
+                oraclePrice /= int256(10 ** (chainlinkDecimals - PRICE_DECIMALS));
+            }
+            uint32 minimumPrice = uint32(uint256((oraclePrice * 995)/1000));
+            if (price < minimumPrice) {
+                revert PriceTooLow(price, minimumPrice);
+            }
+            uint32 maximumPrice = uint32(uint256((oraclePrice * 1005)/1000));
+            if (price > maximumPrice) {
+                revert PriceTooHigh(price, maximumPrice);
+            }
+        }
+        deleteExpiredRequests();
+        address account = msg.sender;
+        uint128 id = requestIds.generate();
         requests[id] = Request({id: id, price: price, amount: amount, deadline: deadline, account: account});
         emit RequestTrade(account, id, price, amount, deadline);
     }
