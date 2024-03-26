@@ -3,292 +3,136 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {ExtendedAccessControlUpgradeable} from "./ExtendedAccessControlUpgradeable.sol";
-import {LinkedListLibrary, LinkedList} from "./LinkedList.sol";
-import {Limiter, LimiterLibrary} from "./Limiter.sol";
+import {WhitelistableUpgradeable} from "./WhitelistableUpgradeable.sol";
+import {AggregatorV3Interface} from "./AggregatorV3Interface.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {Nonces} from "@openzeppelin/contracts/utils/Nonces.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
-function floorDiv(int256 a, int256 b) pure returns (int256 quotient) {
-    quotient = a / b;
-    int256 remainder = a % b;
-    if (remainder != 0 && ((a < 0) != (b < 0))) {
-        quotient--;
-    }
-}
-
-interface AggregatorV3Interface {
-  function decimals() external view returns (uint8);
-
-  function description() external view returns (string memory);
-
-  function version() external view returns (uint256);
-
-  function getRoundData(
-    uint80 _roundId
-  ) external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
-
-  function latestRoundData()
-    external
-    view
-    returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
-}
-
-contract Exchange is ExtendedAccessControlUpgradeable {
-    struct Request {
+contract Exchange is EIP712, Nonces, WhitelistableUpgradeable, ExtendedAccessControlUpgradeable {
+    struct TradeParams {
         address account;
-        uint128 id;
-        uint32 price;
-        int64 amount;
-        uint32 deadline;
+        IERC20 tokenIn;
+        IERC20 tokenOut;
+        uint256 amountIn;
+        uint256 amountOut;
+        uint256 minimumAmountOut;
+        uint256 deadline;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
     }
 
-    error SenderUnauthorized();
-    error DeadlineExpired();
-    error DeadlineExceedsMaxDuration();
-    error PriceTooLow(uint32 price, uint32 referencePrice);
-    error PriceTooHigh(uint32 price, uint32 referencePrice);
-    error AmountTooLow(uint64 amount, uint64 minimumAmount);
-    error LimitExceeded();
+    error InvalidSigner(address signer, address account);
+    error DeadlineExpired(uint256 deadline, uint256 timestamp);
+    error AmountTooLow(uint256 amount, uint256 minimumAmount);
+    error BeneficiaryAlreadyExists(IERC20 token, address beneficiary);
+    error BeneficiaryNotDefined(IERC20 token, address beneficiary);
 
-    bytes32 public constant LIMIT_ROLE = keccak256("LIMIT_ROLE");
-    bytes32 public constant ACCEPT_ROLE = keccak256("ACCEPT_ROLE");
+    event AddBeneficiary(IERC20 indexed token, address indexed beneficiary);
+    event RemoveBeneficiary(IERC20 indexed token, address indexed beneficiary);
+    event Transfer(IERC20 indexed token, address indexed to, uint256 amount);
+    event Trade(
+        address indexed account,
+        IERC20 indexed tokenIn,
+        IERC20 indexed tokenOut,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 timestamp
+    );
 
-    address public immutable BASE_TOKEN;
-    address public immutable QUOTE_TOKEN;
-    address public immutable VAULT;
-    uint256 public constant PRICE_DECIMALS = 6;
-    uint64 public constant MINIMUM_AMOUNT = 1000000000;
-    uint32 public constant MAXIMUM_DURATION = 900;
-    AggregatorV3Interface public immutable CHAINLINK_ORACLE;
+    bytes32 public constant BENEFICIARY_ROLE = keccak256("BENEFICIARY_ROLE");
+    bytes32 public constant TRANSFER_ROLE = keccak256("TRANSFER_ROLE");
+    bytes32 public constant TRADE_ROLE = keccak256("TRADE_ROLE");
+    bytes32 public constant WHITELIST_ROLE = keccak256("WHITELIST_ROLE");
 
-    Limiter limiter;
-    using LimiterLibrary for Limiter;
-    LinkedList requestIds;
-    using LinkedListLibrary for LinkedList;
-    mapping(uint128 => Request) requests;
+    bytes32 public constant TRADE_TYPEHASH =
+        keccak256(
+            "Trade(address account,address tokenIn,address tokenOut,uint256 amountIn,uint256 minimumAmountOut,uint256 nonce,uint256 deadline)"
+        );
 
-    /**
-     * @dev Emitted when a trade is accepted.
-     */
-    event AcceptTrade(address indexed account, uint128 indexed id, uint32 price);
+    mapping(IERC20 => mapping(address => bool)) private _beneficiaries;
 
-    /**
-     * @dev Emitted when the 24-hour transfer limit is changed to `limit`.
-     */
-    event ChangeLimit(uint256 limit);
-
-    /**
-     * @dev Emitted when a request is cancelled.
-     */
-    event DeleteRequest(address indexed account, uint128 indexed id);
-
-    /**
-     * @dev Emitted when a trade is requested.
-     */
-    event RequestTrade(address indexed account, uint128 indexed id, uint32 price, int64 amount, uint32 deadline);
-
-    /**
-     * @dev Emitted when the 24-hour transfer limit is temporarily decreased by `limitDecrease`.
-     */
-    event TemporarilyDecreaseLimit(uint256 limitDecrease);
-
-    /**
-     * @dev Emitted when the 24-hour transfer limit is temporarily increased by `limitIncrease`.
-     */
-    event TemporarilyIncreaseLimit(uint256 limitIncrease);
-
-    constructor(address baseToken, address quoteToken, address vault, AggregatorV3Interface chainlinkOracle) {
+    constructor() EIP712("Exchange", "1") {
         _disableInitializers();
-        BASE_TOKEN = baseToken;
-        QUOTE_TOKEN = quoteToken;
-        VAULT = vault;
-        CHAINLINK_ORACLE = chainlinkOracle;
     }
 
     function initialize(address defaultAdmin) public initializer {
         __ExtendedAccessControl_init();
-        _addRole(LIMIT_ROLE);
-        _addRole(ACCEPT_ROLE);
+        __Whitelistable_init();
+        _addRole(BENEFICIARY_ROLE);
+        _addRole(TRADE_ROLE);
+        _addRole(TRANSFER_ROLE);
+        _addRole(WHITELIST_ROLE);
         _grantRoles(defaultAdmin);
-        limiter.interval = 24 hours;
     }
 
-    function _deleteRequest(uint128 id) internal {
-        requestIds.remove(id);
-        delete requests[id];
-        emit DeleteRequest(msg.sender, id);
-    }
-
-    function acceptTrade(uint128 requestId, uint32 price) public onlyRole(ACCEPT_ROLE) {
-        Request storage request = requests[requestId];
-        if (request.deadline < block.timestamp) {
-            revert DeadlineExpired();
+    function trade(TradeParams memory params) public onlyRole(TRADE_ROLE) whitelisted(params.account) {
+        if (block.timestamp > params.deadline) {
+            revert DeadlineExpired(params.deadline, block.timestamp);
         }
-        int256 baseAmount = request.amount;
-        int256 quoteAmount = computeQuoteAmount(price, baseAmount);
-        if (baseAmount > 0) {
-            if (price > request.price) {
-                revert PriceTooHigh(price, request.price);
-            }
-            if (!limiter.addOperation(uint256(baseAmount))) {
-                revert LimitExceeded();
-            }
-            IERC20(BASE_TOKEN).transferFrom(VAULT, request.account, uint256(baseAmount));
-        } else {
-            if (price < request.price) {
-                revert PriceTooLow(price, request.price);
-            }
-            if (!limiter.addOperation(uint256(-baseAmount))) {
-                revert LimitExceeded();
-            }
-            IERC20(BASE_TOKEN).transferFrom(request.account, VAULT, uint256(-baseAmount));
+        if (params.amountOut < params.minimumAmountOut) {
+            revert AmountTooLow(params.amountOut, params.minimumAmountOut);
         }
-        if (quoteAmount > 0) {
-            IERC20(QUOTE_TOKEN).transferFrom(VAULT, request.account, uint256(quoteAmount));
-        } else {
-            IERC20(QUOTE_TOKEN).transferFrom(request.account, VAULT, uint256(-quoteAmount));
+        bytes32 structHash = keccak256(
+            abi.encode(
+                TRADE_TYPEHASH,
+                params.account,
+                params.tokenIn,
+                params.tokenOut,
+                params.amountIn,
+                params.minimumAmountOut,
+                _useNonce(params.account),
+                params.deadline
+            )
+        );
+        bytes32 hash = _hashTypedDataV4(structHash);
+        address signer = ECDSA.recover(hash, params.v, params.r, params.s);
+        if (signer != params.account) {
+            revert InvalidSigner(signer, params.account);
         }
-        requestIds.remove(requestId);
-        delete requests[requestId];
-        emit AcceptTrade(request.account, requestId, price);
+        params.tokenIn.transferFrom(params.account, address(this), params.amountIn);
+        params.tokenOut.transfer(params.account, params.amountOut);
+        emit Trade(params.account, params.tokenIn, params.tokenOut, params.amountIn, params.amountOut, block.timestamp);
     }
 
-    function cancelRequest(uint128 requestId) public {
-        Request storage request = requests[requestId];
-        if (request.id != 0) {
-            if (request.account != msg.sender) {
-                revert SenderUnauthorized();
-            }
-            _deleteRequest(requestId);
+    function unWhitelist(address account) public onlyRole(WHITELIST_ROLE) {
+        _unWhitelist(account);
+    }
+
+    function whitelist(address account) public onlyRole(WHITELIST_ROLE) {
+        _whitelist(account);
+    }
+
+    function DOMAIN_SEPARATOR() external view virtual returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
+    function isBeneficiary(IERC20 token, address account) public view returns (bool) {
+        return _beneficiaries[token][account];
+    }
+
+    function addBeneficiary(IERC20 token, address beneficiary) public onlyRole(BENEFICIARY_ROLE) {
+        if (isBeneficiary(token, beneficiary)) {
+            revert BeneficiaryAlreadyExists(token, beneficiary);
         }
+        _beneficiaries[token][beneficiary] = true;
+        emit AddBeneficiary(token, beneficiary);
     }
 
-    function computeQuoteAmount(uint32 price, int256 baseAmount) public pure returns (int256) {
-        return floorDiv(-baseAmount * int256(uint256(price)), int256(10 ** PRICE_DECIMALS));
-    }
-
-    function deleteExpiredRequest(uint128 id) public {
-        Request memory request = requests[id];
-        if (request.deadline < block.timestamp) {
-            _deleteRequest(id);
+    function removeBeneficiary(IERC20 token, address beneficiary) public onlyRole(BENEFICIARY_ROLE) {
+        if (!isBeneficiary(token, beneficiary)) {
+            revert BeneficiaryNotDefined(token, beneficiary);
         }
+        delete _beneficiaries[token][beneficiary];
+        emit RemoveBeneficiary(token, beneficiary);
     }
 
-    function deleteExpiredRequests(uint128[] memory ids) public {
-        for (uint256 i = 0; i < ids.length; i++) {
-            deleteExpiredRequest(ids[i]);
+    function transfer(IERC20 token, address to, uint256 amount) public onlyRole(TRANSFER_ROLE) {
+        if (!isBeneficiary(token, to)) {
+            revert BeneficiaryNotDefined(token, to);
         }
-    }
-
-    function deleteExpiredRequests(address account) public {
-        uint128 id = requestIds.first();
-        while (id != 0) {
-            Request memory request = requests[id];
-            if (request.deadline < block.timestamp && (account == address(0) || request.account == account)) {
-                _deleteRequest(id);
-            }
-            id = requestIds.next(id);
-        }
-    }
-
-    function deleteExpiredRequests() public {
-        deleteExpiredRequests(address(0));
-    }
-
-    function getRequests() public view returns (Request[] memory) {
-        Request[] memory _requests = new Request[](requestIds.length());
-        uint128 id = requestIds.first();
-        uint256 i = 0;
-        while (id != 0) {
-            _requests[i++] = requests[id];
-            id = requestIds.next(id);
-        }
-        return _requests;
-    }
-
-    function requestTrade(uint32 price, int64 amount, uint32 deadline) public {
-        if (deadline < block.timestamp) {
-            revert DeadlineExpired();
-        }
-        if (deadline > block.timestamp + MAXIMUM_DURATION) {
-            revert DeadlineExceedsMaxDuration();
-        }
-        if (amount > 0) {
-            if (uint64(amount) < MINIMUM_AMOUNT) {
-                revert AmountTooLow(uint64(amount), MINIMUM_AMOUNT);
-            }
-        } else {
-            if (uint64(-amount) < MINIMUM_AMOUNT) {
-                revert AmountTooLow(uint64(-amount), MINIMUM_AMOUNT);
-            }
-        }
-        if (address(CHAINLINK_ORACLE) != address(0)) {
-            (, int256 oraclePrice, , , ) = CHAINLINK_ORACLE.latestRoundData();
-            uint8 chainlinkDecimals = CHAINLINK_ORACLE.decimals();
-            if (chainlinkDecimals < PRICE_DECIMALS) {
-                oraclePrice *= int256(10 ** (PRICE_DECIMALS - chainlinkDecimals));
-            } else if (chainlinkDecimals > PRICE_DECIMALS) {
-                oraclePrice /= int256(10 ** (chainlinkDecimals - PRICE_DECIMALS));
-            }
-            uint32 minimumPrice = uint32(uint256((oraclePrice * 995)/1000));
-            if (price < minimumPrice) {
-                revert PriceTooLow(price, minimumPrice);
-            }
-            uint32 maximumPrice = uint32(uint256((oraclePrice * 1005)/1000));
-            if (price > maximumPrice) {
-                revert PriceTooHigh(price, maximumPrice);
-            }
-        }
-        deleteExpiredRequests();
-        address account = msg.sender;
-        uint128 id = requestIds.generate();
-        requests[id] = Request({id: id, price: price, amount: amount, deadline: deadline, account: account});
-        emit RequestTrade(account, id, price, amount, deadline);
-    }
-
-    function requestTradeWithPermit(
-        uint32 price,
-        int64 amount,
-        uint32 deadline,
-        uint256 value,
-        uint8 v,
-        bytes32 r,
-        bytes32 s
-    ) public {
-        address account = msg.sender;
-        if (amount > 0) {
-            IERC20Permit(QUOTE_TOKEN).permit(account, address(this), value, deadline, v, r, s);
-        } else {
-            IERC20Permit(BASE_TOKEN).permit(account, address(this), value, deadline, v, r, s);
-        }
-        requestTrade(price, amount, deadline);
-    }
-
-    /**
-     * @dev Sets the 24-hour transfer limit.
-     * Can only be called by an account with the LIMIT_ROLE.
-     * @param _limit The limit value to be set.
-     */
-    function setLimit(uint256 _limit) public onlyRole(LIMIT_ROLE) {
-        limiter.limit = _limit;
-        emit ChangeLimit(_limit);
-    }
-
-    /**
-     * @dev Temporarily increases the 24-hour transfer limiter.
-     * Can only be called by an account with the LIMIT_ROLE.
-     * @param _limitIncrease Amount by which the limit should be increased.
-     */
-    function temporarilyIncreaseLimit(uint256 _limitIncrease) public onlyRole(LIMIT_ROLE) {
-        limiter.temporarilyIncreaseLimit(_limitIncrease);
-        emit TemporarilyIncreaseLimit(_limitIncrease);
-    }
-
-    /**
-     * @dev Temporarily decreases the 24-hour transfer limiter.
-     * Can only be called by an account with the LIMIT_ROLE.
-     * @param _limitDecrease Amount by which the limit should be decreased.
-     */
-    function temporarilyDecreaseLimit(uint256 _limitDecrease) public onlyRole(LIMIT_ROLE) {
-        limiter.temporarilyDecreaseLimit(_limitDecrease);
-        emit TemporarilyDecreaseLimit(_limitDecrease);
+        token.transfer(to, amount);
+        emit Transfer(token, to, amount);
     }
 }
